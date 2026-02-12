@@ -265,10 +265,9 @@ impl GcOpsMutator {
                 .copied()
                 .expect("rec_groups not empty");
 
-            ops.types.type_defs.retain(|_, def| def.rec_group != gid);
             ops.types.rec_groups.remove(&gid);
 
-            log::debug!("Removed rec group {gid:?} and its member types");
+            log::debug!("Removed rec group {gid:?}");
             Ok(())
         })?;
         Ok(())
