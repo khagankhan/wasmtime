@@ -1,8 +1,9 @@
 use cranelift_bitset::CompoundBitSet;
 use std::{
-    alloc::{Layout, alloc},
+    alloc::{Layout, alloc, dealloc},
     fmt::{self, Write},
     iter,
+    ops::Deref,
     sync::atomic::{AtomicU32, Ordering::SeqCst},
 };
 use wasmtime::{error::OutOfMemory, *};
@@ -13,6 +14,38 @@ use wasmtime_fuzzing::oom::{OomTest, OomTestAllocator};
 #[global_allocator]
 static GLOBAL_ALOCATOR: OomTestAllocator = OomTestAllocator::new();
 
+/// RAII wrapper around a raw allocation to deallocate it on drop.
+struct Alloc {
+    layout: Layout,
+    ptr: *mut u8,
+}
+
+impl Drop for Alloc {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                dealloc(self.ptr, self.layout);
+            }
+        }
+    }
+}
+
+impl Deref for Alloc {
+    type Target = *mut u8;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ptr
+    }
+}
+
+impl Alloc {
+    /// Safety: same as `std::alloc::alloc`.
+    unsafe fn new(layout: Layout) -> Self {
+        let ptr = unsafe { alloc(layout) };
+        Alloc { layout, ptr }
+    }
+}
+
 #[test]
 fn smoke_test_ok() -> Result<()> {
     OomTest::new().test(|| Ok(()))
@@ -21,8 +54,8 @@ fn smoke_test_ok() -> Result<()> {
 #[test]
 fn smoke_test_missed_oom() -> Result<()> {
     let err = OomTest::new()
-        .test(|| {
-            let _ = unsafe { alloc(Layout::new::<u64>()) };
+        .test(|| unsafe {
+            let _ = Alloc::new(Layout::new::<u64>());
             Ok(())
         })
         .unwrap_err();
@@ -32,6 +65,38 @@ fn smoke_test_missed_oom() -> Result<()> {
         "should have missed an OOM, got: {err}"
     );
     Ok(())
+}
+
+#[test]
+fn smoke_test_disallow_alloc_after_oom() -> Result<()> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = OomTest::new().test(|| unsafe {
+            let layout = Layout::new::<u64>();
+            let p = Alloc::new(layout);
+            let _q = Alloc::new(layout);
+            if p.is_null() {
+                Err(OutOfMemory::new(layout.size()).into())
+            } else {
+                Ok(())
+            }
+        });
+    }));
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[test]
+fn smoke_test_allow_alloc_after_oom() -> Result<()> {
+    OomTest::new().allow_alloc_after_oom(true).test(|| unsafe {
+        let layout = Layout::new::<u64>();
+        let p = Alloc::new(layout);
+        let q = Alloc::new(layout);
+        if p.is_null() || q.is_null() {
+            Err(OutOfMemory::new(layout.size()).into())
+        } else {
+            Ok(())
+        }
+    })
 }
 
 #[test]
@@ -669,4 +734,179 @@ fn vec_extend() -> Result<()> {
         vec.try_extend([(), (), ()])?;
         Ok(())
     })
+}
+
+#[test]
+fn index_map_try_clone() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map1 = IndexMap::new();
+            map1.insert("a", try_new::<Box<_>>(42)?)?;
+            map1.insert("b", try_new::<Box<_>>(36)?)?;
+            let map2 = map1.try_clone()?;
+            assert_eq!(map1, map2);
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_with_capacity() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let _map = IndexMap::<&str, usize>::with_capacity(100)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_split_off() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map1 = IndexMap::new();
+            map1.insert("a", 42)?;
+            map1.insert("b", 36)?;
+
+            let map2 = map1.split_off(1)?;
+
+            assert_eq!(map1.len(), 1);
+            assert_eq!(map2.len(), 1);
+            assert_eq!(map1[&"a"], 42);
+            assert_eq!(map1[0], 42);
+            assert_eq!(map2[&"b"], 36);
+            assert_eq!(map2[0], 36);
+
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_reserve() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::<u32, u32>::new();
+            map.reserve(100)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_reserve_exact() -> Result<()> {
+    OomTest::new().test(|| {
+        let mut map = IndexMap::<u32, u32>::new();
+        map.reserve_exact(100)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn index_map_insert() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert(10, 20)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_insert_full() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert_full(10, 20)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_insert_sorted() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert_sorted(10, 20)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_insert_sorted_by() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert_sorted_by(10, 20, |_k, _v, _k2, _v2| core::cmp::Ordering::Less)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_insert_sorted_by_key() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert_sorted_by_key(10, 20, |_k, v| *v)?;
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_insert_before() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert("a", 20)?;
+            map.insert("b", 30)?;
+            map.insert_before(1, "c", 40)?;
+            assert_eq!(map[0], 20);
+            assert_eq!(map[1], 40);
+            assert_eq!(map[2], 30);
+            Ok(())
+        })
+}
+
+#[test]
+fn index_map_shift_insert() -> Result<()> {
+    OomTest::new()
+        // `indexmap` will first try to double its capacity, and, if that fails,
+        // will then try to allocate only as much as it absolutely must.
+        .allow_alloc_after_oom(true)
+        .test(|| {
+            let mut map = IndexMap::new();
+            map.insert("a", 20)?;
+            map.insert("b", 30)?;
+            map.shift_insert(1, "c", 40)?;
+            assert_eq!(map[0], 20);
+            assert_eq!(map[1], 40);
+            assert_eq!(map[2], 30);
+            Ok(())
+        })
 }
