@@ -55,7 +55,7 @@ impl Types {
         }
     }
 
-    /// Break cycles in `supertype` edges *within* each rec-group by dropping some edges.
+    /// Break cycles in supertype edges within each rec-group by dropping some edges.
     pub fn break_type_cycles_in_rec_groups(&mut self) {
         // Kill self-edges to avoid cycles.
         for (id, def) in self.type_defs.iter_mut() {
@@ -214,7 +214,7 @@ impl Types {
             *indeg.get_mut(&g).unwrap() = ds.len();
         }
 
-        // reverse edges: prerequisite -> dependents
+        //  Prerequisite -> dependents
         let mut users: BTreeMap<RecGroupId, Vec<RecGroupId>> = BTreeMap::new();
         for (&g, ds) in &deps {
             for &d in ds {
@@ -263,7 +263,6 @@ impl Types {
             .map(|id| (Event::Enter, id))
             .collect();
 
-        // Same trick: make deterministic order with a stack.
         stack.reverse();
 
         let mut sorted = Vec::with_capacity(self.type_defs.len());
