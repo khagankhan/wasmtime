@@ -4,6 +4,7 @@ use crate::generators::gc_ops::ops::{GcOp, GcOps};
 use crate::generators::gc_ops::types::{RecGroupId, TypeId};
 use mutatis::{Candidates, Context, DefaultMutate, Generate, Mutate, Result as MutResult};
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 
 /// A mutator for the gc ops.
 #[derive(Debug)]
@@ -192,7 +193,7 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that duplicates a (rec ...) group.
+    /// Define a mutation that duplicates a (rec ...) group.
     fn duplicate_rec_group(
         &mut self,
         c: &mut Candidates<'_>,
@@ -200,54 +201,55 @@ impl GcOpsMutator {
     ) -> mutatis::Result<()> {
         if c.shrink()
             || ops.types.rec_groups.is_empty()
-            || ops.types.rec_groups.len() >= usize::try_from(ops.limits.max_rec_groups).unwrap()
-            || ops.types.type_defs.len() >= usize::try_from(ops.limits.max_types).unwrap()
+            || ops.types.rec_groups.len() >= ops.limits.max_rec_groups as usize
+            || ops.types.type_defs.len() >= ops.limits.max_types as usize
         {
             return Ok(());
         }
+
         c.mutation(|ctx| {
-            let source_gid = ctx
+            let source_gid = *ctx
                 .rng()
                 .choose(&ops.types.rec_groups)
-                .copied()
                 .expect("rec_groups not empty");
+
+            // Collect (TypeId, is_final, supertype) for members of the source group.
+            let mut members: SmallVec<[(TypeId, bool, Option<TypeId>); 32]> = SmallVec::new();
+            for (tid, def) in ops.types.type_defs.iter() {
+                if def.rec_group == source_gid {
+                    members.push((*tid, def.is_final, def.supertype));
+                }
+            }
 
             // Create a new rec group.
             let new_gid = ops.types.fresh_rec_group_id(ctx.rng());
             ops.types.insert_rec_group(new_gid);
 
-            let count = ops
-                .types
-                .type_defs
-                .values()
-                .filter(|def| def.rec_group == source_gid)
-                .count();
-
-            // Skip empty rec groups.
-            if count == 0 {
-                return Ok(());
+            // Allocate fresh type ids for each member.
+            // We need to correctly match the supertypes in the new group as well.
+            // We keep track of the old type ids to new type ids in a map.
+            let mut old_to_new: BTreeMap<TypeId, TypeId> = BTreeMap::new();
+            for (old_tid, _, _) in &members {
+                old_to_new.insert(*old_tid, ops.types.fresh_type_id(ctx.rng()));
             }
 
-            // Since our structs are empty, we can just insert them into the new rec group.
-            // We will update mutators while adding new features to the fuzzer.
-            for _ in 0..count {
-                let new_tid = ops.types.fresh_type_id(ctx.rng());
-                let is_final = (ctx.rng().gen_u32() % 4) == 0;
-                let keys: Vec<TypeId> = ops.types.type_defs.keys().copied().collect();
-                let supertype = if keys.is_empty() {
-                    None
-                } else {
-                    ctx.rng().choose(&keys).copied()
-                };
+            // Insert duplicated defs, rewriting intra-group supertype edges to the cloned ids.
+            for (old_tid, is_final, supertype) in &members {
+                // Get the new type id for the old type id.
+                let new_tid = old_to_new[old_tid];
+
+                // Map the supertype to the new type id.
+                // If it has no supertype, we keep it as None.
+                // If its supertype is in the same group, we map it to the new type id.
+                // If its supertype is in a different group, we keep it as is.
+                let mapped_super = supertype.map(|st| *old_to_new.get(&st).unwrap_or(&st));
                 ops.types
-                    .insert_empty_struct(new_tid, new_gid, is_final, supertype);
+                    .insert_empty_struct(new_tid, new_gid, *is_final, mapped_super);
             }
 
-            log::debug!(
-                "Duplicated rec group {source_gid:?} as new group {new_gid:?} ({count} types)"
-            );
             Ok(())
         })?;
+
         Ok(())
     }
 
