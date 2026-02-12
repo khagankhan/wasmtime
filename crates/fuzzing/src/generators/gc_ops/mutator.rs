@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 pub struct GcOpsMutator;
 
 impl GcOpsMutator {
-    // Define a mutation that adds an operation to the ops list.
+    /// Define a mutation that adds an operation to the ops list.
     fn add_operation(&mut self, c: &mut Candidates<'_>, ops: &mut GcOps) -> mutatis::Result<()> {
         if c.shrink() {
             return Ok(());
@@ -26,7 +26,7 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that removes an operation from the ops list.
+    /// Define a mutation that removes an operation from the ops list.
     fn remove_operation(&mut self, c: &mut Candidates<'_>, ops: &mut GcOps) -> mutatis::Result<()> {
         if ops.ops.is_empty() {
             return Ok(());
@@ -59,15 +59,23 @@ impl GcOpsMutator {
                 .copied()
                 .expect("rec_groups not empty");
             let new_tid = ops.types.fresh_type_id(ctx.rng());
-            ops.types.insert_empty_struct(new_tid, group_id);
+            let is_final = (ctx.rng().gen_u32() % 4) == 0;
+            let keys: Vec<TypeId> = ops.types.type_defs.keys().copied().collect();
+            let supertype = if keys.is_empty() {
+                None
+            } else {
+                ctx.rng().choose(&keys).copied()
+            };
+            ops.types
+                .insert_empty_struct(new_tid, group_id, is_final, supertype);
             log::debug!("Added empty struct type {new_tid:?} to rec group {group_id:?}");
             Ok(())
         })?;
         Ok(())
     }
 
-    // Define a mutation that removes a struct type from an existing (rec ...).
-    // It may result in empty rec groups. Empty rec groups are allowed.
+    /// Define a mutation that removes a struct type from an existing (rec ...).
+    /// It may result in empty rec groups. Empty rec groups are allowed.
     fn remove_struct_type_from_rec_group(
         &mut self,
         c: &mut Candidates<'_>,
@@ -89,7 +97,7 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that moves a struct type within an existing rec group.
+    /// Define a mutation that moves a struct type within an existing rec group.
     fn move_struct_type_within_rec_group(
         &mut self,
         c: &mut Candidates<'_>,
@@ -154,9 +162,9 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that moves a struct type from one (rec ...) group to another.
-    // It will be a different rec group with high probability but it may try
-    // to move it to the same rec group.
+    /// Define a mutation that moves a struct type from one (rec ...) group to another.
+    /// It will be a different rec group with high probability but it may try
+    /// to move it to the same rec group.
     fn move_struct_type_between_rec_groups(
         &mut self,
         c: &mut Candidates<'_>,
@@ -223,8 +231,16 @@ impl GcOpsMutator {
             // Since our structs are empty, we can just insert them into the new rec group.
             // We will update mutators while adding new features to the fuzzer.
             for _ in 0..count {
+                let new_tid = ops.types.fresh_type_id(ctx.rng());
+                let is_final = (ctx.rng().gen_u32() % 4) == 0;
+                let keys: Vec<TypeId> = ops.types.type_defs.keys().copied().collect();
+                let supertype = if keys.is_empty() {
+                    None
+                } else {
+                    ctx.rng().choose(&keys).copied()
+                };
                 ops.types
-                    .insert_empty_struct(ops.types.fresh_type_id(ctx.rng()), new_gid);
+                    .insert_empty_struct(new_tid, new_gid, is_final, supertype);
             }
 
             log::debug!(
@@ -235,7 +251,7 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that removes a whole (rec ...) group.
+    /// Define a mutation that removes a whole (rec ...) group.
     fn remove_rec_group(&mut self, c: &mut Candidates<'_>, ops: &mut GcOps) -> mutatis::Result<()> {
         if ops.types.rec_groups.len() <= 2 {
             return Ok(());
@@ -256,7 +272,7 @@ impl GcOpsMutator {
         Ok(())
     }
 
-    // Define a mutation that merges two (rec ...) groups.
+    /// Define a mutation that merges two (rec ...) groups.
     fn merge_rec_groups(&mut self, c: &mut Candidates<'_>, ops: &mut GcOps) -> mutatis::Result<()> {
         if ops.types.rec_groups.is_empty() || ops.types.rec_groups.len() <= 2 {
             return Ok(());
