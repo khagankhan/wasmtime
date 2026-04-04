@@ -25,6 +25,7 @@ struct WasmEncodingBases {
     typed_global_base: u32,
     struct_table_idx: u32,
     typed_table_base: u32,
+    downcast_block_type_base: u32,
 }
 
 /// A description of a Wasm module that makes a series of `externref` table
@@ -157,6 +158,26 @@ impl GcOps {
                     heap_type: wasm_encoder::HeapType::Concrete(concrete),
                 })],
                 vec![],
+            );
+        }
+
+        // Block types for fallible downcasts:
+        //   (param (ref null struct)) (result (ref null $concrete_i))
+        let downcast_block_type_base: u32 = typed_fn_type_base + struct_count;
+        for i in 0..struct_count {
+            let concrete = struct_type_base + i;
+            types.ty().function(
+                vec![ValType::Ref(RefType {
+                    nullable: true,
+                    heap_type: wasm_encoder::HeapType::Abstract {
+                        shared: false,
+                        ty: wasm_encoder::AbstractHeapType::Struct,
+                    },
+                })],
+                vec![ValType::Ref(RefType {
+                    nullable: true,
+                    heap_type: wasm_encoder::HeapType::Concrete(concrete),
+                })],
             );
         }
 
@@ -314,6 +335,7 @@ impl GcOps {
             typed_global_base,
             struct_table_idx,
             typed_table_base,
+            downcast_block_type_base,
         };
 
         let mut func = Function::new(local_decls);
@@ -584,6 +606,20 @@ macro_rules! for_each_gc_op {
                 type_index = type_index.checked_rem(num_types)?;
             })]
             NullTypedStruct { type_index: u32 },
+
+            #[operands([Some(Struct(Some(type_index)))])]
+            #[results([Struct(Some(type_index))])]
+            #[fixup(|_limits, num_types| {
+                type_index = type_index.checked_rem(num_types)?;
+            })]
+            RefCast { type_index: u32 },
+
+            #[operands([Some(Struct(None))])]
+            #[results([Struct(Some(type_index))])]
+            #[fixup(|_limits, num_types| {
+                type_index = type_index.checked_rem(num_types)?;
+            })]
+            RefCastDowncast { type_index: u32 },
         }
     };
 }
@@ -816,6 +852,50 @@ impl GcOp {
                 func.instruction(&Instruction::RefNull(wasm_encoder::HeapType::Concrete(
                     encoding_bases.struct_type_base + type_index,
                 )));
+            }
+            Self::RefCast { type_index } => {
+                func.instruction(&Instruction::RefCastNullable(
+                    wasm_encoder::HeapType::Concrete(
+                        encoding_bases.struct_type_base + type_index,
+                    ),
+                ));
+            }
+            Self::RefCastDowncast { type_index } => {
+                // Fallible downcast: try to cast to a subtype, producing
+                // null on failure instead of trapping.
+                //
+                // block (param (ref null struct)) (result (ref null $sub))
+                //   local.tee $struct_local     ;; save the operand
+                //   ref.test null $sub          ;; test if downcast succeeds
+                //   if (result (ref null $sub))
+                //     local.get $struct_local   ;; reload the saved ref
+                //     ref.cast null $sub        ;; cast (safe: test passed)
+                //   else
+                //     ref.null $sub             ;; null on failure
+                //   end
+                // end
+                let concrete_type = encoding_bases.struct_type_base + type_index;
+                let heap = wasm_encoder::HeapType::Concrete(concrete_type);
+                let result_type = ValType::Ref(RefType {
+                    nullable: true,
+                    heap_type: heap,
+                });
+                let block_ty = encoding_bases.downcast_block_type_base + type_index;
+
+                func.instruction(&Instruction::Block(wasm_encoder::BlockType::FunctionType(
+                    block_ty,
+                )));
+                func.instruction(&Instruction::LocalTee(encoding_bases.struct_local_idx));
+                func.instruction(&Instruction::RefTestNullable(heap));
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    result_type,
+                )));
+                func.instruction(&Instruction::LocalGet(encoding_bases.struct_local_idx));
+                func.instruction(&Instruction::RefCastNullable(heap));
+                func.instruction(&Instruction::Else);
+                func.instruction(&Instruction::RefNull(heap));
+                func.instruction(&Instruction::End);
+                func.instruction(&Instruction::End);
             }
             Self::StructNew { type_index: x } => {
                 func.instruction(&Instruction::StructNew(encoding_bases.struct_type_base + x));
