@@ -131,6 +131,11 @@ fn check_valid_wasm(ops: &GcOps) -> Result<(), String> {
         | wasmparser::WasmFeatures::GC_TYPES;
     let mut validator = wasmparser::Validator::new_with_features(feats);
 
+    println!(
+        "=== Wat ===\n\n{}",
+        wasmprinter::print_bytes(&wasm).unwrap()
+    );
+
     validator.validate_all(&wasm).map(|_| ()).map_err(|e| {
         let wat =
             wasmprinter::print_bytes(&wasm).unwrap_or_else(|e| format!("<disasm failed: {e}>"));
@@ -1180,4 +1185,119 @@ fn fixup_repoints_dangling_references() {
         ),
         ref other => panic!("dangling reference was erased instead of re-pointed: {other:?}"),
     }
+}
+
+/// A `(ref null? $t)` struct field.
+fn ref_field(type_id: TypeId, nullable: bool) -> StructField {
+    StructField {
+        field_type: FieldType::Ref { nullable, type_id },
+        mutable: false,
+    }
+}
+
+/// The nullability of field `index` of `ty`, which must be a reference field.
+fn field_nullable(types: &Types, ty: TypeId, index: usize) -> bool {
+    match types.type_defs[&ty].composite_type.fields()[index].field_type {
+        FieldType::Ref { nullable, .. } | FieldType::StructRef { nullable } => nullable,
+        ref other => panic!("field {index} of {ty:?} is not a reference: {other:?}"),
+    }
+}
+
+/// Helper: `GcOps` whose types are built by `build` into a single rec group.
+fn typed_test_ops(ops: Vec<GcOp>, build: impl FnOnce(&mut Types, RecGroupId)) -> GcOps {
+    let mut t = GcOps {
+        limits: GcOpsLimits {
+            num_params: 0,
+            num_globals: 0,
+            table_size: 0,
+            max_rec_groups: 5,
+            max_types: 32,
+            max_fields: 8,
+            array_length: 5,
+        },
+        ops,
+        types: Types::new(),
+    };
+    let g = RecGroupId(0);
+    t.types.insert_rec_group(g);
+    build(&mut t.types, g);
+    t
+}
+
+#[test]
+fn uninhabitable_cycle_is_relaxed_without_giving_up_the_rest() {
+    let _ = env_logger::try_init();
+
+    // `$1` and `$2` reference each other non-nullably, so neither can ever be
+    // constructed; `$3` -> `$4` is well founded and must survive untouched.
+    // Relaxing everything in sight would also produce a valid module, so the
+    // second assertion is what keeps the repair honest.
+    let ops = typed_test_ops(vec![GcOp::StructNew { type_index: 0 }], |types, g| {
+        types.insert_struct(TypeId(1), g, false, None, vec![ref_field(TypeId(2), false)]);
+        types.insert_struct(TypeId(2), g, false, None, vec![ref_field(TypeId(1), false)]);
+        types.insert_struct(
+            TypeId(3),
+            g,
+            false,
+            None,
+            vec![StructField {
+                field_type: FieldType::I32,
+                mutable: false,
+            }],
+        );
+        types.insert_struct(TypeId(4), g, false, None, vec![ref_field(TypeId(3), false)]);
+    });
+
+    assert_valid_wasm(&ops);
+
+    let mut after = ops.clone();
+    let _ = after.to_wasm_binary();
+    assert_eq!(
+        after.types.inhabitable().len(),
+        after.types.type_defs.len(),
+        "every type must be constructible once the cycle is broken"
+    );
+    assert!(
+        !field_nullable(&after.types, TypeId(4), 0),
+        "a well-founded non-nullable reference must not be relaxed"
+    );
+}
+
+#[test]
+fn deep_reference_ladder_does_not_blow_up() {
+    let _ = env_logger::try_init();
+
+    // Each level holds four non-nullable references to the level below, so
+    // building one object at the top means building 4^7 at the bottom: 21845
+    // `struct.new` and 164KB of Wasm before prototypes existed. Encoding order
+    // puts the top of the ladder at index 0.
+    const LEVELS: u32 = 8;
+    let mut ops = typed_test_ops(vec![GcOp::StructNew { type_index: 0 }], |types, g| {
+        types.insert_struct(
+            TypeId(0),
+            g,
+            false,
+            None,
+            vec![StructField {
+                field_type: FieldType::I32,
+                mutable: false,
+            }],
+        );
+        for lvl in 1..LEVELS {
+            let fields = (0..4).map(|_| ref_field(TypeId(lvl - 1), false)).collect();
+            types.insert_struct(TypeId(lvl), g, false, None, fields);
+        }
+    });
+
+    assert_valid_wasm(&ops);
+
+    let wasm = ops.to_wasm_binary();
+    let wat = wasmprinter::print_bytes(&wasm).unwrap();
+    let news = wat.matches("struct.new").count();
+    assert!(
+        news < 100,
+        "deep ladder should be built via prototypes, got {news} `struct.new` \
+         in {} bytes of Wasm",
+        wasm.len()
+    );
 }

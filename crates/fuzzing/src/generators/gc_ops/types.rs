@@ -96,10 +96,9 @@ macro_rules! define_field_type_enum {
 
             /// Concrete `(ref null? $t)` referencing a defined struct type.
             Ref {
-                // `nullable` is ignored because support for non-nullable
-                // references isn't implemented yet and so `Types::fixup`
-                // unconditionally forces it to `true`. Mutating it here would
-                // be a waste of time.
+                // `nullable` is not mutated directly; it takes whatever value
+                // the variant was constructed with, and `Types::fixup` relaxes
+                // it to `true` only when the reference cannot be satisfied.
                 #[mutatis(ignore)]
                 nullable: bool,
 
@@ -151,15 +150,35 @@ macro_rules! define_field_type_enum {
                 matches!(self, FieldType::I8 | FieldType::I16)
             }
 
-            /// Emit a default constant for this field type onto the stack
+            /// Whether this field type has a default value, and therefore
+            /// whether a type containing it can be built with
+            /// `struct.new_default` / `array.new_default`.
+            ///
+            /// A non-nullable reference does not: there is no null to default
+            /// to, and Wasm rejects `*.new_default` on such a type.
+            pub fn is_defaultable(self) -> bool {
+                !matches!(
+                    self,
+                    FieldType::StructRef { nullable: false }
+                        | FieldType::Ref { nullable: false, .. }
+                )
+            }
+
+            /// Emit a value of this field type onto the stack.
+            ///
+            /// Nullable references use `ref.null`, which is always available.
+            /// A non-nullable reference has no null to fall back on, so we must
+            /// construct a real object; see `emit_new`.
             pub fn emit_default_const(
                 self,
                 func: &mut wasm_encoder::Function,
+                types: &Types,
+                protos: &BTreeMap<TypeId, u32>,
                 type_ids_to_index: &BTreeMap<TypeId, u32>,
             ) {
                 match self {
                     $( FieldType::$variant => { func.instruction(&$default_val); } )*
-                    FieldType::StructRef { .. } => {
+                    FieldType::StructRef { nullable: true } => {
                         func.instruction(&wasm_encoder::Instruction::RefNull(
                             wasm_encoder::HeapType::Abstract {
                                 shared: false,
@@ -167,7 +186,20 @@ macro_rules! define_field_type_enum {
                             },
                         ));
                     }
-                    FieldType::Ref { type_id, .. } => {
+                    FieldType::StructRef { nullable: false } => {
+                        // `(ref struct)` is satisfied by any struct, so build
+                        // the cheapest one. `fix_uninhabitable` only leaves
+                        // this field non-nullable when such a struct exists.
+                        let tid = types.least_rank_inhabitable_struct().unwrap_or_else(|| {
+                            unreachable!(
+                                "non-nullable `(ref struct)` field but no inhabitable \
+                                 struct type exists; `fix_uninhabitable` should have \
+                                 relaxed this field to nullable"
+                            )
+                        });
+                        emit_ref_to(tid, func, types, protos, type_ids_to_index);
+                    }
+                    FieldType::Ref { nullable: true, type_id } => {
                         // See `to_storage_type`: a missing index is a fixup bug.
                         // Emitting `ref.null struct` here would produce a value
                         // that does not match the field's concrete `(ref null
@@ -182,12 +214,84 @@ macro_rules! define_field_type_enum {
                             wasm_encoder::HeapType::Concrete(idx),
                         ));
                     }
+                    FieldType::Ref { nullable: false, type_id } => {
+                        emit_ref_to(type_id, func, types, protos, type_ids_to_index);
+                    }
                 }
             }
         }
     };
 }
 for_each_field_type!(define_field_type_enum);
+
+/// Emit instructions constructing a non-null value of type `type_id`.
+///
+/// Structs are built field by field, which recurses back through
+/// `FieldType::emit_default_const` whenever a field is itself a non-nullable
+/// reference. That recursion is well-founded: `Types::fixup` runs
+/// `fix_uninhabitable`, so a non-nullable field always points at a type that
+/// entered `Types::inhabitable`'s fixpoint in an earlier round than the type
+/// holding the field. Depth is therefore bounded by the number of types.
+///
+/// Arrays are built with `array.new_fixed $t 0`, which takes no element values
+/// at all and so never recurses. That yields an empty array, useless for
+/// `array.get`, but this path runs only to fill a non-nullable field, where any
+/// value will do; ops that want a usable array build their own with an explicit
+/// length.
+/// Push a non-null reference to `type_id`: read the shared prototype when this
+/// type has one, otherwise build a fresh object.
+fn emit_ref_to(
+    type_id: TypeId,
+    func: &mut wasm_encoder::Function,
+    types: &Types,
+    protos: &BTreeMap<TypeId, u32>,
+    type_ids_to_index: &BTreeMap<TypeId, u32>,
+) {
+    match protos.get(&type_id) {
+        Some(&local) => {
+            // The prologue fills every prototype at the top of each loop
+            // iteration, before any op runs, so this never traps.
+            func.instruction(&wasm_encoder::Instruction::LocalGet(local));
+            func.instruction(&wasm_encoder::Instruction::RefAsNonNull);
+        }
+        None => emit_new(type_id, func, types, protos, type_ids_to_index),
+    }
+}
+
+pub(crate) fn emit_new(
+    type_id: TypeId,
+    func: &mut wasm_encoder::Function,
+    types: &Types,
+    protos: &BTreeMap<TypeId, u32>,
+    type_ids_to_index: &BTreeMap<TypeId, u32>,
+) {
+    let &idx = type_ids_to_index.get(&type_id).unwrap_or_else(|| {
+        unreachable!(
+            "reference to {type_id:?} missing from index map; fixup should keep \
+             all reference targets"
+        )
+    });
+    let def = types
+        .type_defs
+        .get(&type_id)
+        .unwrap_or_else(|| unreachable!("reference to {type_id:?}, which has no definition"));
+    match &def.composite_type {
+        CompositeType::Struct(st) => {
+            for field in &st.fields {
+                field
+                    .field_type
+                    .emit_default_const(func, types, protos, type_ids_to_index);
+            }
+            func.instruction(&wasm_encoder::Instruction::StructNew(idx));
+        }
+        CompositeType::Array(_) => {
+            func.instruction(&wasm_encoder::Instruction::ArrayNewFixed {
+                array_type_index: idx,
+                array_size: 0,
+            });
+        }
+    }
+}
 
 /// A single field within a struct type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, mutatis::Mutate)]
@@ -819,24 +923,19 @@ impl Types {
         let valid_type_ids: BTreeSet<TypeId> = self.type_defs.keys().copied().collect();
         for def in self.type_defs.values_mut() {
             for field in def.composite_type.fields_mut() {
-                match &mut field.field_type {
-                    FieldType::StructRef { nullable } => *nullable = true,
-                    FieldType::Ref { nullable, type_id } => {
-                        if !valid_type_ids.contains(type_id) {
-                            if let Some(live) =
-                                nearest_live_type_id(&valid_type_ids, *type_id, None)
-                            {
-                                *type_id = live;
-                            }
-                        }
-                        if valid_type_ids.contains(type_id) {
-                            *nullable = true;
-                        } else {
-                            // There are no types at all to point at.
-                            field.field_type = FieldType::StructRef { nullable: true };
+                // Nullability is left alone here; step 11 relaxes only the
+                // non-nullable references that cannot be satisfied.
+                if let FieldType::Ref { type_id, .. } = &mut field.field_type {
+                    if !valid_type_ids.contains(type_id) {
+                        if let Some(live) = nearest_live_type_id(&valid_type_ids, *type_id, None) {
+                            *type_id = live;
                         }
                     }
-                    _ => {}
+                    if !valid_type_ids.contains(type_id) {
+                        // There are no types at all to point at, so there is
+                        // nothing this reference could ever be made to hold.
+                        field.field_type = FieldType::StructRef { nullable: true };
+                    }
                 }
             }
         }
@@ -897,10 +996,125 @@ impl Types {
             }
         }
 
+        // 11. Relax non-nullable reference fields
+        self.fix_uninhabitable();
+
         debug_assert!(self.is_well_formed(limits));
 
-        // 11. Compute encoding order (reuses type_to_group from step 9).
+        // 12. Compute encoding order (reuses type_to_group from step 9).
         self.encoding_order_grouped(encoding_order_grouped, &type_to_group);
+    }
+
+    /// Compute the types that can actually be constructed, each mapped to the
+    /// fixpoint round it entered in. That round is a rank: a non-nullable field
+    /// of a rank `r` type can always be filled by a type of rank `< r`, which
+    /// is what makes `emit_new`'s recursion terminate.
+    pub(crate) fn inhabitable(&self) -> BTreeMap<TypeId, u32> {
+        let mut ok = BTreeMap::new();
+        let mut round = 0;
+        loop {
+            let mut grew = false;
+            for (&tid, def) in &self.type_defs {
+                if ok.contains_key(&tid) {
+                    continue;
+                }
+                let constructible = def.composite_type.fields().iter().all(|field| {
+                    match field.field_type {
+                        // Any subtype of the referent will do, including the
+                        // referent itself; `is_subtype` is reflexive.
+                        FieldType::Ref {
+                            nullable: false,
+                            type_id,
+                        } => ok.keys().any(|&c| self.is_subtype(c, type_id)),
+
+                        // `(ref struct)` is satisfied by any struct. Arrays are
+                        // not structs, and neither are i31s.
+                        FieldType::StructRef { nullable: false } => ok
+                            .keys()
+                            .any(|&c| !self.type_defs[&c].composite_type.is_array()),
+
+                        // Scalars and nullable references always have a
+                        // default value available.
+                        //
+                        // Note an array with a non-nullable element is treated
+                        // as uninhabitable even though `array.new_fixed $t 0`
+                        // could build an empty one. That is deliberate: the
+                        // generator wants arrays of `array_length` so indexed
+                        // accesses land in bounds, and a forced-empty array
+                        // traps on every one of them.
+                        _ => true,
+                    }
+                });
+                if constructible {
+                    ok.insert(tid, round);
+                    grew = true;
+                }
+            }
+            if !grew {
+                return ok;
+            }
+            round += 1;
+        }
+    }
+
+    /// Relax reference fields to nullable until every type is inhabitable.
+    pub(crate) fn fix_uninhabitable(&mut self) {
+        loop {
+            let ok = self.inhabitable();
+            if ok.len() == self.type_defs.len() {
+                return;
+            }
+            let bad = *self
+                .type_defs
+                .keys()
+                .find(|tid| !ok.contains_key(tid))
+                .expect("set of inhabitable types is a strict subset, so an offender exists");
+            for index in 0..self.type_defs[&bad].composite_type.fields().len() {
+                self.relax_field(bad, index);
+            }
+        }
+    }
+
+    /// Make field `index` of `tid` nullable, along with every type that shares
+    /// that field through subtyping.
+    ///
+    /// Step 10 requires a subtype's fields to match its supertype's exactly, so
+    /// relaxing one type in isolation would break that invariant.
+    fn relax_field(&mut self, tid: TypeId, index: usize) {
+        // Walk up to the highest ancestor that still has this field. Supertype
+        // cycles are already broken by step 9, so this terminates.
+        let mut root = tid;
+        while let Some(sup) = self.type_defs[&root].supertype {
+            if self.type_defs[&sup].composite_type.fields().len() <= index {
+                break;
+            }
+            root = sup;
+        }
+
+        // Relax it there and in every descendant that inherits it.
+        let affected: Vec<TypeId> = self
+            .type_defs
+            .keys()
+            .copied()
+            .filter(|&t| self.is_subtype(t, root))
+            .collect();
+        for t in affected {
+            let fields = self
+                .type_defs
+                .get_mut(&t)
+                .unwrap()
+                .composite_type
+                .fields_mut();
+            let Some(field) = fields.get_mut(index) else {
+                continue;
+            };
+            match &mut field.field_type {
+                FieldType::Ref { nullable, .. } | FieldType::StructRef { nullable } => {
+                    *nullable = true;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Check if the types are well-formed and within configured limits, i.e.
@@ -947,21 +1161,13 @@ impl Types {
                 return false;
             }
 
-            // Reference fields must be nullable (non-nullable references are
-            // deferred), and concrete references must target an existing type.
+            // Concrete references must target an existing type.
             for field in fields {
-                match field.field_type {
-                    FieldType::StructRef { nullable } | FieldType::Ref { nullable, .. }
-                        if !nullable =>
-                    {
-                        log::debug!("[-] Failed: type {tid:?} has a non-nullable reference field");
-                        return false;
-                    }
-                    FieldType::Ref { type_id, .. } if !self.type_defs.contains_key(&type_id) => {
+                if let FieldType::Ref { type_id, .. } = field.field_type {
+                    if !self.type_defs.contains_key(&type_id) {
                         log::debug!("[-] Failed: type {tid:?} references missing type {type_id:?}");
                         return false;
                     }
-                    _ => {}
                 }
             }
 
@@ -1007,7 +1213,113 @@ impl Types {
                 }
             }
         }
+
+        // Every type must be constructible. A non-nullable reference field has
+        // no default value, so a cycle of them leaves types that validate but
+        // can never be instantiated. See `fix_uninhabitable`.
+        let inhabitable = self.inhabitable();
+        if inhabitable.len() != self.type_defs.len() {
+            log::debug!(
+                "[-] Failed: {} of {} types are uninhabitable",
+                self.type_defs.len() - inhabitable.len(),
+                self.type_defs.len()
+            );
+            return false;
+        }
+
         true
+    }
+
+    /// The types that should be built once into a shared prototype local
+    /// rather than rebuilt at every use, in rank order (a valid build order).
+    ///
+    /// Building a non-nullable field means building its referent, which means
+    /// building *its* referents: a type with `b` such fields at depth `d`
+    /// expands to `b^d` objects. A prototype cuts that off, since reading one
+    /// costs two instructions no matter how large the object is.
+    ///
+    /// Types cheap enough to build inline are left alone, so shallow object
+    /// graphs stay varied instead of every reference aliasing one object.
+    pub(crate) fn prototype_types(&self, threshold: u32) -> Vec<TypeId> {
+        let ranks = self.inhabitable();
+        let mut by_rank: Vec<(u32, TypeId)> = ranks.iter().map(|(&t, &r)| (r, t)).collect();
+        by_rank.sort();
+
+        // Hoisted: the same struct fills every non-nullable `(ref struct)`.
+        let abstract_target = self.least_rank_inhabitable_struct();
+
+        // Only types some non-nullable field actually points at can be read
+        // from a prototype local. Giving one to any other type would emit a
+        // build nothing ever uses.
+        let mut referenced: BTreeSet<TypeId> = BTreeSet::new();
+        for def in self.type_defs.values() {
+            for field in def.composite_type.fields() {
+                match field.field_type {
+                    FieldType::Ref {
+                        nullable: false,
+                        type_id,
+                    } => {
+                        referenced.insert(type_id);
+                    }
+                    FieldType::StructRef { nullable: false } => {
+                        referenced.extend(abstract_target);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // `cost[t]` is what one value of `t` costs at a use site. Rank order
+        // means every referent's cost is known before we need it.
+        let mut cost: BTreeMap<TypeId, u32> = BTreeMap::new();
+        let mut protos = Vec::new();
+        for (_, tid) in by_rank {
+            let inline = match &self.type_defs[&tid].composite_type {
+                // `array.new_fixed $t 0` takes no element values.
+                CompositeType::Array(_) => 1,
+                CompositeType::Struct(st) => st.fields.iter().fold(1u32, |acc: u32, field| {
+                    let field_cost = match field.field_type {
+                        FieldType::Ref {
+                            nullable: false,
+                            type_id,
+                        } => cost.get(&type_id).copied().unwrap_or(1),
+                        FieldType::StructRef { nullable: false } => abstract_target
+                            .and_then(|t| cost.get(&t).copied())
+                            .unwrap_or(1),
+                        // A single `const` or `ref.null`.
+                        _ => 1,
+                    };
+                    acc.saturating_add(field_cost)
+                }),
+            };
+            if inline > threshold {
+                if referenced.contains(&tid) {
+                    protos.push(tid);
+                }
+                // `local.get` + `ref.as_non_null`. Recorded even for an
+                // unreferenced type: its cost is then never consulted, and
+                // keeping the branches in step avoids a second rule.
+                cost.insert(tid, 2);
+            } else {
+                cost.insert(tid, inline);
+            }
+        }
+        protos
+    }
+
+    /// The inhabitable struct of least rank, used to fill a non-nullable
+    /// `(ref struct)` field. `None` when no such type exists, in which case
+    /// `fix_uninhabitable` will have relaxed every such field.
+    ///
+    /// Rank, not type id: picking by id can return the very type whose field we
+    /// are filling, and `emit_new` would recurse forever.
+    pub(crate) fn least_rank_inhabitable_struct(&self) -> Option<TypeId> {
+        self.inhabitable()
+            .into_iter()
+            .filter(|(tid, _)| !self.type_defs[tid].composite_type.is_array())
+            // Tie-break on id to stay deterministic.
+            .min_by_key(|&(tid, rank)| (rank, tid))
+            .map(|(tid, _)| tid)
     }
 }
 
